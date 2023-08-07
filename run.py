@@ -35,35 +35,6 @@ def main(tablenames, chunk_num):
 
         upload_to_db(tablename, db_con, data)
 
-def json_load(src_path):
-    """Читает schemas.json.
-
-    Args:
-        src_path (str): Рабочая директория.
-    """
-    try:
-        with open(os.path.join(src_path, 'schemas.json')) as json_file:
-            return json.load(json_file)
-    except FileNotFoundError:
-        print(f'Schemas.json в директории {src_path} не найден.')
-        sys.exit()
-
-def get_all_tablenames(src_path):
-    """Список всех таблиц в рабочей директории.
-
-    Args:
-        src_path (str): Рабочая директория.
-    """
-    try:
-        return [
-            f
-            for f in os.listdir(src_path)
-            if os.path.isdir(os.path.join(src_path, f))
-        ]
-    except Exception as e:
-        print(f'Проблема в директории src_path.\n{e}')
-        sys.exit()
-
 def get_env_value(key):
     """Получает значение переменной окружения.
 
@@ -102,6 +73,35 @@ def get_con_params():
             connection.close()
     
     return db_con
+
+def json_load(src_path):
+    """Читает schemas.json.
+
+    Args:
+        src_path (str): Рабочая директория.
+    """
+    try:
+        with open(os.path.join(src_path, 'schemas.json')) as json_file:
+            return json.load(json_file)
+    except FileNotFoundError:
+        print(f'Schemas.json в директории {src_path} не найден.')
+        sys.exit()
+
+def get_all_tablenames(src_path):
+    """Список всех таблиц в рабочей директории.
+
+    Args:
+        src_path (str): Рабочая директория.
+    """
+    try:
+        return [
+            f
+            for f in os.listdir(src_path)
+            if os.path.isdir(os.path.join(src_path, f))
+        ]
+    except Exception as e:
+        print(f'Проблема в директории src_path.\n{e}')
+        sys.exit()
 
 def get_table_columns_from_schema(src_path, tablename, schemas):
     """Получает имена полей из файла schemas.json.
@@ -158,41 +158,12 @@ def read_csv(src_path, tablename, columns, chunk_num):
                 names=columns,
                 chunksize=chunk_num,
             )
-
-            # Проверка содержимого файла, если он делится на чанки
-            if isinstance(data[filename], abc.Iterator):
-                valid = validate_chunks(tablename, filename, data[filename])
-                # Переинициализация итератора
-                data[filename] = pd.read_csv(
-                    full_path,
-                    names=columns,
-                    chunksize=chunk_num,
-                ) if valid else None
         except Exception as e:
             print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
             data[filename] = None
 
     data = {k: v for k, v in data.items() if v is not None}
     return data
-
-def validate_chunks(tablename, filename, data):
-    """Проверка содержимого файла, если он разделен на чанки.
-
-    Args:
-        tablename (str): Название таблицы.
-        filename (str): Название файла.
-        data (Iterator): Итератор чанков.
-
-    Returns:
-        bool: False, если проблема с файлом; True, если файл - ок.
-    """
-    try:
-        for chunk in data:
-            pass
-    except Exception as e:
-        print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
-        return False
-    return True
 
 def upload_to_db(tablename, db_con, data):
     """Выбор режима загрузки в бд.
@@ -212,14 +183,20 @@ def upload_to_db(tablename, db_con, data):
 
         # Eсли есть разделение на чанки и кол-во ядер равно 1
         elif isinstance(item, abc.Iterator) and cpu_count == 1:
-            for i, data in enumerate(item):
-                results.append(to_sql(tablename, filename, db_con, (i, data)))
+            try:
+                for i, data in enumerate(item):
+                    results.append(to_sql(tablename, filename, db_con, (i, data)))
+            except Exception as e:
+                print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
 
         # Если есть разделение на чанки и используем многопроцессорность
         elif isinstance(item, abc.Iterator):
-            with mp.Pool(cpu_count) as pool:
-                partial_to_sql = partial(to_sql, tablename, filename, db_con)
-                results.extend(pool.map(partial_to_sql, enumerate(item)))
+            try:
+                with mp.Pool(cpu_count) as pool:
+                    partial_to_sql = partial(to_sql, tablename, filename, db_con)
+                    results.extend(pool.map(partial_to_sql, enumerate(item)))
+            except Exception as e:
+                print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
 
         else:
             print(f'Проблема с файлом {filename} таблицы {tablename}.')
