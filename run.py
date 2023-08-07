@@ -5,8 +5,10 @@ import pandas as pd
 from sqlalchemy import create_engine
 import argparse as ap
 import collections.abc as abc
+import multiprocessing as mp
+from functools import partial
 
-def main(tables, chunk_num):
+def main(tablenames, chunk_num):
     """Загружает данные таблицы из CSV источников в бд.
 
     Args:
@@ -16,22 +18,14 @@ def main(tables, chunk_num):
     src_path = get_env_value('src_path')
     db_con = get_con_params()
 
-    # Если не выбраны таблицы, берутся все из src_path.
-    if not tables:
-        try:
-            tables = [
-                f for f in os.listdir(src_path)
-                if os.path.isdir(os.path.join(src_path, f))
-            ]
-        except FileNotFoundError:
-            print(f'Не найдена директория {tables}.')
-            return
-        except Exception as e:
-            print(f'Проблема с директорией src_path.\n{e}')
-            return
+    schemas = json_load(src_path)
 
-    for tablename in tables:
-        columns = get_table_columns_from_schema(src_path, tablename)
+    # Если не выбраны таблицы, берутся все из src_path
+    if not tablenames:
+        tablenames = get_all_tablenames(src_path)
+
+    for tablename in tablenames:
+        columns = get_table_columns_from_schema(src_path, tablename, schemas)
         if not columns:
             continue
 
@@ -40,6 +34,35 @@ def main(tables, chunk_num):
             continue
 
         upload_to_db(tablename, db_con, data)
+
+def json_load(src_path):
+    """Читает schemas.json.
+
+    Args:
+        src_path (str): Рабочая директория.
+    """
+    try:
+        with open(os.path.join(src_path, 'schemas.json')) as json_file:
+            return json.load(json_file)
+    except FileNotFoundError:
+        print(f'Schemas.json в директории {src_path} не найден.')
+        sys.exit()
+
+def get_all_tablenames(src_path):
+    """Список всех таблиц в рабочей директории.
+
+    Args:
+        src_path (str): Рабочая директория.
+    """
+    try:
+        return [
+            f
+            for f in os.listdir(src_path)
+            if os.path.isdir(os.path.join(src_path, f))
+        ]
+    except Exception as e:
+        print(f'Проблема в директории src_path.\n{e}')
+        sys.exit()
 
 def get_env_value(key):
     """Получает значение переменной окружения.
@@ -60,23 +83,27 @@ def get_con_params():
     """Получает параметры подключения и проверяет соединение.
 
     Returns:
-        Engine: Экземпляр движка соединения.
+        str: Адрес подключения к базе данных.
     """
     env_vars = ["db_username", "db_password", "db_host", "db_port", "db_name"]
     db_params ={var: get_env_value(var) for var in env_vars}
-    db_con = create_engine(f"postgresql://{db_params['db_username']}:{db_params['db_password']}@{db_params['db_host']}:{db_params['db_port']}/{db_params['db_name']}")
+    db_con = f"postgresql://{db_params['db_username']}:{db_params['db_password']}@{db_params['db_host']}:{db_params['db_port']}/{db_params['db_name']}"
 
     # Проверка соединения
+    connection = None
     try:
-        connection = db_con.connect()
-        connection.close()
+        my_engine = create_engine(db_con)
+        connection = my_engine.connect()
     except Exception as e:
         print(f'Возникла ошибка при подключении к базе данных.\n{e}')
-        return None
+        sys.exit()
+    finally:
+        if connection:
+            connection.close()
     
     return db_con
 
-def get_table_columns_from_schema(src_path, tablename):
+def get_table_columns_from_schema(src_path, tablename, schemas):
     """Получает имена полей из файла schemas.json.
 
     Args:
@@ -86,18 +113,12 @@ def get_table_columns_from_schema(src_path, tablename):
     Returns:
         list: Список полей.
     """
-    try:
-        with open(os.path.join(src_path, 'schemas.json')) as json_file:
-            schemas = json.load(json_file)
-    except FileNotFoundError:
-        print(f'Schemas.json в директории {src_path} не найден.')
-        sys.exit()
-
-    if tablename not in schemas:
+    table_schema = schemas.get(tablename, [])
+    if not table_schema:
         print(f'Для {tablename} нет описания в schemas.json.')
         return []
 
-    columns = [jc['column_name'] for jc in schemas[tablename]]
+    columns = [jc['column_name'] for jc in table_schema]
     return columns
 
 def read_csv(src_path, tablename, columns, chunk_num):
@@ -110,44 +131,51 @@ def read_csv(src_path, tablename, columns, chunk_num):
         chunk_num (int): Кол-во чанков.
 
     Returns:
-        dict: Словарь с данными таблиц, где ключ - название csv файла.
+        dict: Словарь с данными и кодировкой, где ключ - название csv файла.
     """
     dir_path = os.path.join(src_path, tablename)
     if not os.path.exists(dir_path):
         print(f'Не найдена директория {tablename}.')
         return {}
 
-    filenames = os.listdir(dir_path)
+    filenames = [
+        f
+        for f in os.listdir(dir_path)
+        if os.path.isfile(os.path.join(dir_path, f))
+    ]
     if not filenames:
         print(f'Нет новых данных для {tablename}.')
         return {}
 
     data = {}
     for filename in filenames:
-        full_path = os.path.join(src_path, tablename, filename)
+        full_path = os.path.join(dir_path, filename)
+            
         try:
+            # Чтение файла
             data[filename] = pd.read_csv(
                 full_path,
                 names=columns,
-                chunksize=chunk_num
+                chunksize=chunk_num,
             )
 
             # Проверка содержимого файла, если он делится на чанки
             if isinstance(data[filename], abc.Iterator):
-                valid = validate_file(tablename, filename, data[filename])
+                valid = validate_chunks(tablename, filename, data[filename])
                 # Переинициализация итератора
                 data[filename] = pd.read_csv(
                     full_path,
                     names=columns,
-                    chunksize=chunk_num
+                    chunksize=chunk_num,
                 ) if valid else None
         except Exception as e:
-            print(f'Проблема с файлом {filename} (таблица {tablename}).\n{e}.')
+            print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
             data[filename] = None
 
+    data = {k: v for k, v in data.items() if v is not None}
     return data
 
-def validate_file(tablename, filename, data):
+def validate_chunks(tablename, filename, data):
     """Проверка содержимого файла, если он разделен на чанки.
 
     Args:
@@ -156,39 +184,77 @@ def validate_file(tablename, filename, data):
         data (Iterator): Итератор чанков.
 
     Returns:
-        bool: False, если проблема с файлом.
+        bool: False, если проблема с файлом; True, если файл - ок.
     """
     try:
         for chunk in data:
             pass
-    except pd.errors.ParserError as e:
-        print(f'Проблема с файлом {filename} (таблица {tablename}).\n{e}')
+    except Exception as e:
+        print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
         return False
     return True
 
 def upload_to_db(tablename, db_con, data):
+    """Выбор режима загрузки в бд.
+
+    Args:
+        tablename (str): Название таблицы.
+        db_con (str): Адрес подключения.
+        data (dict): Словарь с данными таблиц, где ключ - название csv файла.
+    """
+    cpu_count = os.cpu_count() or 1
+
+    results = []
+    for filename, item in data.items():
+        # Если нет разделения на чанки
+        if isinstance(item, pd.DataFrame):
+            results.append(to_sql(tablename, filename, db_con, (0, item)))
+
+        # Eсли есть разделение на чанки и кол-во ядер равно 1
+        elif isinstance(item, abc.Iterator) and cpu_count == 1:
+            for i, data in enumerate(item):
+                results.append(to_sql(tablename, filename, db_con, (i, data)))
+
+        # Если есть разделение на чанки и используем многопроцессорность
+        elif isinstance(item, abc.Iterator):
+            with mp.Pool(cpu_count) as pool:
+                partial_to_sql = partial(to_sql, tablename, filename, db_con)
+                results.extend(pool.map(partial_to_sql, enumerate(item)))
+
+        else:
+            print(f'Проблема с файлом {filename} таблицы {tablename}.')
+            continue
+
+        if all(results):
+            print(f'Файл {filename} таблицы {tablename} успешно загружен.')
+        results = []
+
+def to_sql(tablename, filename, db_con, chunk):
     """Загрузка данных таблиц в бд.
 
     Args:
         tablename (str): Название таблицы.
-        db_con (Engine): Движок подключения.
-        data (dict): Словарь с данными таблиц, где ключ - название csv файла.
+        filename (str): Название файла.
+        db_con (str): Адрес подключения.
+        chunk (int, DataFrame): Кортеж, датафрейм и его индекс.
     """
-    for filename, item in data.items():
-        # Если не было разделения на чанки
-        if isinstance(item, pd.DataFrame):
-            chunks = [item]
-        elif isinstance(item, abc.Iterator):
-            chunks = item
-        else:
-            continue
-
-        for i, chunk in enumerate(chunks):
-            try:
-                chunk.to_sql(tablename, db_con, if_exists='append', index=False)
-                print(f'{tablename}, {filename}, чанк {i} загружен в бд.')
-            except Exception as e:
-                print(f'Ошибка при загрузке {tablename}, {filename}, чанк {i}.\n{e}')
+    i, data = chunk
+    # Пересоздаем движок из-за многопроцессорности
+    my_engine = create_engine(db_con)
+    try:
+        data.to_sql(
+            tablename,
+            my_engine,
+            if_exists='append',
+            index=False,
+            method='multi'
+        )
+        return True
+    except Exception as e:
+        print(f"Ошибка при загрузке {tablename}, {filename}, чанк {i}.")
+        # Чтобы не выводить в консоль INSERT
+        print(str(e).split('\n')[0])
+        return False
 
 if __name__ == '__main__':
     parser = ap.ArgumentParser(description='Загрузка табличных данных CSV в бд.')
@@ -196,25 +262,22 @@ if __name__ == '__main__':
     parser.add_argument(
         '-t', '--tables',
         type=str,
+        default='',
         help='Список таблиц, разделенных запятыми'
     )
     parser.add_argument(
         '-ch', '--chunks',
         type=int,
+        default=None,
         help='Количество чанков для последовательной загрузки в бд'
     )
 
     args = parser.parse_args()
-
-    if args.tables:
-        tables = args.tables.split(', ')
-    else:
-        tables = []
+    
+    tables = args.tables.split(',') if args.tables else []
+    if not tables:
         print('Обрабатываю все таблицы.')
 
-    if args.chunks:
-        chunk_num = args.chunks
-    else:
-        chunk_num = None
+    chunk_num = args.chunks
     
     main(tables, chunk_num)
