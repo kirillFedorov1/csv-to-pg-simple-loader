@@ -7,6 +7,14 @@ import argparse as ap
 import collections.abc as abc
 from functools import partial
 import concurrent.futures as cf
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 def main(tablenames, chunk_num):
     """Загружает данные таблицы из CSV источников в бд.
@@ -47,7 +55,7 @@ def get_env_value(key):
     try:
         return os.environ[key]
     except KeyError:
-        print(f'Не задана переменная окружения \'{key}\'.')
+        logger.error(f'Не задана переменная окружения \'{key}\'.')
         sys.exit()
 
 def get_con_params():
@@ -66,7 +74,7 @@ def get_con_params():
         my_engine = create_engine(db_con)
         connection = my_engine.connect()
     except Exception as e:
-        print(f'Возникла ошибка при подключении к базе данных.\n{e}')
+        logger.error(f'Возникла ошибка при подключении к базе данных.\n{e}')
         sys.exit()
     finally:
         if connection:
@@ -84,7 +92,7 @@ def json_load(src_path):
         with open(os.path.join(src_path, 'schemas.json')) as json_file:
             return json.load(json_file)
     except FileNotFoundError:
-        print(f'Schemas.json в директории {src_path} не найден.')
+        logger.error(f'Schemas.json в директории {src_path} не найден.')
         sys.exit()
 
 def get_all_tablenames(src_path):
@@ -100,7 +108,7 @@ def get_all_tablenames(src_path):
             if os.path.isdir(os.path.join(src_path, f))
         ]
     except Exception as e:
-        print(f'Проблема в директории src_path.\n{e}')
+        logger.error(f'Проблема в директории src_path.\n{e}')
         sys.exit()
 
 def get_table_columns_from_schema(src_path, tablename, schemas):
@@ -115,7 +123,7 @@ def get_table_columns_from_schema(src_path, tablename, schemas):
     """
     table_schema = schemas.get(tablename, [])
     if not table_schema:
-        print(f'Для {tablename} нет описания в schemas.json.')
+        logger.error(f'Для {tablename} нет описания в schemas.json.')
         return []
 
     columns = [jc['column_name'] for jc in table_schema]
@@ -135,7 +143,7 @@ def read_csv(src_path, tablename, columns, chunk_num):
     """
     dir_path = os.path.join(src_path, tablename)
     if not os.path.exists(dir_path):
-        print(f'Не найдена директория {tablename}.')
+        logger.error(f'Не найдена директория {tablename}.')
         return {}
 
     filenames = [
@@ -144,7 +152,7 @@ def read_csv(src_path, tablename, columns, chunk_num):
         if os.path.isfile(os.path.join(dir_path, f))
     ]
     if not filenames:
-        print(f'Нет новых данных для {tablename}.')
+        logger.info(f'Нет новых данных для {tablename}.')
         return {}
 
     data = {}
@@ -159,7 +167,7 @@ def read_csv(src_path, tablename, columns, chunk_num):
                 chunksize=chunk_num,
             )
         except Exception as e:
-            print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
+            logger.error(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
             data[filename] = None
 
     data = {k: v for k, v in data.items() if v is not None}
@@ -179,10 +187,8 @@ def upload_to_db(tablename, my_engine, data):
             to_sql(tablename, filename, my_engine, item)
         # Eсли есть разделение на чанки, использую многопоточность
         elif isinstance(item, abc.Iterator):
-            cpu_count = os.cpu_count() or 1
-
             try:
-                with cf.ThreadPoolExecutor(max_workers=cpu_count) as executor:
+                with cf.ThreadPoolExecutor() as executor:
                     partial_to_sql = partial(to_sql, tablename, filename, my_engine)
                     future_results = {
                         executor.submit(partial_to_sql, (i, chunk))
@@ -194,9 +200,9 @@ def upload_to_db(tablename, my_engine, data):
                     if not result:
                         break
             except Exception as e:
-                print(f"Проблема с файлом {filename}, таблица {tablename}:\n{e}")
+                logger.error(f"Проблема с файлом {filename}, таблица {tablename}:\n{e}")
 
-    print(f'Данные таблицы {tablename} обработаны.')
+    logger.info(f'Данные таблицы {tablename} обработаны.')
 
 def to_sql(tablename, filename, my_engine, chunk):
     """Загрузка данных таблиц в бд.
@@ -225,9 +231,15 @@ def to_sql(tablename, filename, my_engine, chunk):
         )
         return True
     except Exception as e:
-        print(f"Ошибка при загрузке {tablename}, {filename}, чанк {i}.")
         # Чтобы не выводить в консоль весь INSERT
-        print(str(e).split('\n')[0])
+        err_msg = str(e).split('\n')[0]
+        logger.error(
+            f"Ошибка при загрузке"
+            f"{tablename},"
+            f"{filename},"
+            f", чанк {i}."
+            f"\n{err_msg}"
+        )
         return False
 
 if __name__ == '__main__':
@@ -250,7 +262,7 @@ if __name__ == '__main__':
     
     tables = args.tables.split(',') if args.tables else []
     if not tables:
-        print('Обрабатываю все таблицы.')
+        logger.info('Обрабатываю все таблицы.')
 
     chunk_num = args.chunks
     
