@@ -5,8 +5,8 @@ import pandas as pd
 from sqlalchemy import create_engine
 import argparse as ap
 import collections.abc as abc
-import multiprocessing as mp
 from functools import partial
+import concurrent.futures as cf
 
 def main(tablenames, chunk_num):
     """Загружает данные таблицы из CSV источников в бд.
@@ -16,7 +16,7 @@ def main(tablenames, chunk_num):
         chunk_num (int): Кол-во чанков.
     """
     src_path = get_env_value('src_path')
-    db_con = get_con_params()
+    my_engine = create_engine(get_con_params())
 
     schemas = json_load(src_path)
 
@@ -33,7 +33,7 @@ def main(tablenames, chunk_num):
         if not data:
             continue
 
-        upload_to_db(tablename, db_con, data)
+        upload_to_db(tablename, my_engine, data)
 
 def get_env_value(key):
     """Получает значение переменной окружения.
@@ -165,59 +165,56 @@ def read_csv(src_path, tablename, columns, chunk_num):
     data = {k: v for k, v in data.items() if v is not None}
     return data
 
-def upload_to_db(tablename, db_con, data):
+def upload_to_db(tablename, my_engine, data):
     """Выбор режима загрузки в бд.
 
     Args:
         tablename (str): Название таблицы.
-        db_con (str): Адрес подключения.
+        my_engine (Engine): Движок подключения к бд.
         data (dict): Словарь с данными таблиц, где ключ - название csv файла.
     """
-    cpu_count = os.cpu_count() or 1
-
-    results = []
     for filename, item in data.items():
         # Если нет разделения на чанки
         if isinstance(item, pd.DataFrame):
-            results.append(to_sql(tablename, filename, db_con, (0, item)))
-
-        # Eсли есть разделение на чанки и кол-во ядер равно 1
-        elif isinstance(item, abc.Iterator) and cpu_count == 1:
-            try:
-                for i, data in enumerate(item):
-                    results.append(to_sql(tablename, filename, db_con, (i, data)))
-            except Exception as e:
-                print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
-
-        # Если есть разделение на чанки и используем многопроцессорность
+            to_sql(tablename, filename, my_engine, item)
+        # Eсли есть разделение на чанки, использую многопоточность
         elif isinstance(item, abc.Iterator):
+            cpu_count = os.cpu_count() or 1
+
             try:
-                with mp.Pool(cpu_count) as pool:
-                    partial_to_sql = partial(to_sql, tablename, filename, db_con)
-                    results.extend(pool.map(partial_to_sql, enumerate(item)))
+                with cf.ThreadPoolExecutor(max_workers=cpu_count) as executor:
+                    partial_to_sql = partial(to_sql, tablename, filename, my_engine)
+                    future_results = {
+                        executor.submit(partial_to_sql, (i, chunk))
+                        for i, chunk in enumerate(item)
+                    }
+
+                for future in cf.as_completed(future_results):
+                    result = future.result()
+                    if not result:
+                        break
             except Exception as e:
-                print(f'Проблема с файлом {filename} таблицы {tablename}:\n{e}')
+                print(f"Проблема с файлом {filename}, таблица {tablename}:\n{e}")
 
-        else:
-            print(f'Проблема с файлом {filename} таблицы {tablename}.')
-            continue
+    print(f'Данные таблицы {tablename} обработаны.')
 
-        if all(results):
-            print(f'Файл {filename} таблицы {tablename} успешно загружен.')
-        results = []
-
-def to_sql(tablename, filename, db_con, chunk):
+def to_sql(tablename, filename, my_engine, chunk):
     """Загрузка данных таблиц в бд.
 
     Args:
         tablename (str): Название таблицы.
         filename (str): Название файла.
-        db_con (str): Адрес подключения.
+        my_engine (Engine): Движок подключения к бд.
         chunk (int, DataFrame): Кортеж, датафрейм и его индекс.
+
+    Returns:
+        bool: Возвращает True, если загрузка успешна, иначе False.
     """
-    i, data = chunk
-    # Пересоздаем движок из-за многопроцессорности
-    my_engine = create_engine(db_con)
+    if isinstance(chunk, tuple):
+        i, data = chunk
+    else:
+        i = 0
+        data = chunk
     try:
         data.to_sql(
             tablename,
@@ -229,7 +226,7 @@ def to_sql(tablename, filename, db_con, chunk):
         return True
     except Exception as e:
         print(f"Ошибка при загрузке {tablename}, {filename}, чанк {i}.")
-        # Чтобы не выводить в консоль INSERT
+        # Чтобы не выводить в консоль весь INSERT
         print(str(e).split('\n')[0])
         return False
 

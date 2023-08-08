@@ -57,7 +57,7 @@
             "column_position": 1
         },
         {
-            "column_name": "product_cateogry_id",
+            "column_name": "product_category_id",
             "data_type": "integer",
             "column_position": 2
         },
